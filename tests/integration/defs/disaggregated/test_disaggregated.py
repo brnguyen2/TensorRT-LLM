@@ -53,6 +53,7 @@ class TestConfig:
     test_desc: str
     request_count: int
     accuracy_threshold: float
+    incomplete_threshold: float = 1.0
     speculative_model_path: Optional[str] = None
     cancellation_rate: Optional[int] = None
     cancellation_delay: Optional[float] = None
@@ -2914,6 +2915,9 @@ async def _send_mixed_request(session,
         "json_valid": None,
         "latency_ms": 0.0,
         "cancelled": should_cancel,
+        "timed_out": False,
+        "server_rejected": False,
+        "rejection_detail": None,  # diagnostic: HTTP status or exception class
     }
 
     start = time.monotonic()
@@ -2964,8 +2968,22 @@ async def _send_mixed_request(session,
                     result["success"] = result["json_valid"]
                 else:
                     result["success"] = True
-    except Exception:
-        pass  # connection abort on cancel is expected
+            elif not should_cancel and not completed:
+                # Server closed the stream without a valid completion
+                # (e.g. kv_transfer_timeout cancellation, error response).
+                result["server_rejected"] = True
+                result[
+                    "rejection_detail"] = f"http_{resp.status}_incomplete_stream"
+    except asyncio.TimeoutError:
+        # 120s aiohttp client timeout: server never responded in time.
+        result["timed_out"] = True
+    except Exception as e:
+        if not should_cancel:
+            # Unexpected connection error on a non-cancel request counts as
+            # server_rejected (e.g. abrupt RST from server-side cancellation).
+            result["server_rejected"] = True
+            result["rejection_detail"] = type(e).__name__
+        # else: connection abort on intentional cancel is expected
     finally:
         result["latency_ms"] = (time.monotonic() - start) * 1000
         results.append(result)
@@ -2980,10 +2998,19 @@ async def _run_mixed_stress_async(server_url: str,
                                   progress_interval: int = 30) -> dict:
     """Drive total_requests requests at the given concurrency level.
 
-    Returns a summary dict with per-profile counts and an overall accuracy_score.
+    Returns a summary dict with per-profile counts and overall metrics:
+
     accuracy_score = (free_text_successes + json_valid_count)
-                     / (free_text_total + structured_total)
-    Cancelled requests are excluded from the denominator.
+                     / completed_non_cancel_requests
+    Cancelled, timed-out, and server-rejected requests are excluded from the
+    accuracy denominator — accuracy reflects only requests that finished.
+
+    incomplete_rate = (timed_out + server_rejected) / non_cancelled_total
+    timed_out: client-side 120s aiohttp timeout (server never responded).
+    server_rejected: server closed stream without valid completion (e.g.
+        kv_transfer_timeout cancellation, error response, connection reset).
+    Both are reported individually for diagnostics and summed as incomplete_rate
+    for gating.
     """
     import random
 
@@ -3030,12 +3057,16 @@ async def _run_mixed_stress_async(server_url: str,
     # Aggregate
     per_profile: dict = {}
     for r in results:
-        p = per_profile.setdefault(r["profile"], {
-            "total": 0,
-            "success": 0,
-            "json_valid": 0,
-            "cancelled": 0
-        })
+        p = per_profile.setdefault(
+            r["profile"], {
+                "total": 0,
+                "success": 0,
+                "json_valid": 0,
+                "cancelled": 0,
+                "timed_out": 0,
+                "server_rejected": 0,
+                "rejection_details": {},
+            })
         p["total"] += 1
         if r["success"]:
             p["success"] += 1
@@ -3043,19 +3074,54 @@ async def _run_mixed_stress_async(server_url: str,
             p["json_valid"] += 1
         if r["cancelled"]:
             p["cancelled"] += 1
+        if r["timed_out"]:
+            p["timed_out"] += 1
+        if r["server_rejected"]:
+            p["server_rejected"] += 1
+        if r["rejection_detail"]:
+            rd = p["rejection_details"]
+            rd[r["rejection_detail"]] = rd.get(r["rejection_detail"], 0) + 1
+
+    def _completed(v):
+        return v["total"] - v["cancelled"] - v["timed_out"] - v[
+            "server_rejected"]
 
     free_text_ok = sum(v["success"] for k, v in per_profile.items()
                        if "free_text" in k or "long_context" in k)
-    free_text_total = sum(v["total"] for k, v in per_profile.items()
-                          if "free_text" in k or "long_context" in k)
+    free_text_completed = sum(
+        _completed(v) for k, v in per_profile.items()
+        if "free_text" in k or "long_context" in k)
     json_ok = sum(v["json_valid"] for k, v in per_profile.items()
                   if "structured" in k)
-    json_total = sum(v["total"] for k, v in per_profile.items()
-                     if "structured" in k)
-    denom = free_text_total + json_total
-    accuracy_score = (free_text_ok + json_ok) / denom if denom > 0 else 0.0
+    json_completed = sum(
+        _completed(v) for k, v in per_profile.items() if "structured" in k)
+    accuracy_denom = free_text_completed + json_completed
+    accuracy_score = (free_text_ok +
+                      json_ok) / accuracy_denom if accuracy_denom > 0 else 0.0
 
-    return {"per_profile": per_profile, "accuracy_score": accuracy_score}
+    total_non_cancelled = sum(v["total"] - v["cancelled"]
+                              for v in per_profile.values())
+    total_timed_out = sum(v["timed_out"] for v in per_profile.values())
+    total_server_rejected = sum(v["server_rejected"]
+                                for v in per_profile.values())
+    incomplete_rate = ((total_timed_out + total_server_rejected) /
+                       total_non_cancelled if total_non_cancelled > 0 else 0.0)
+
+    # Merge per-profile rejection_details into a global breakdown
+    all_rejection_details: dict = {}
+    for v in per_profile.values():
+        for reason, count in v["rejection_details"].items():
+            all_rejection_details[reason] = (
+                all_rejection_details.get(reason, 0) + count)
+
+    return {
+        "per_profile": per_profile,
+        "accuracy_score": accuracy_score,
+        "incomplete_rate": incomplete_rate,
+        "timed_out": total_timed_out,
+        "server_rejected": total_server_rejected,
+        "rejection_details": all_rejection_details,
+    }
 
 
 def run_disaggregated_mixed_stress(example_dir: str,
@@ -3064,6 +3130,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    total_requests: int = 10000,
                                    concurrency: int = 512,
                                    accuracy_threshold: float = 0.42,
+                                   incomplete_threshold: float = 1.0,
                                    profiles: list = None,
                                    server_start_timeout: int = 7200,
                                    env=None,
@@ -3127,7 +3194,15 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                     model_name=model_path,
                                     progress_callback=progress_callback))
 
-        logger.info("Mixed stress summary: %s", summary)
+        logger.info(
+            "Mixed stress summary: accuracy=%.3f incomplete_rate=%.3f "
+            "(timed_out=%d server_rejected=%d)\nper_profile:\n%s",
+            summary["accuracy_score"], summary["incomplete_rate"],
+            summary["timed_out"], summary["server_rejected"],
+            json.dumps(summary["per_profile"], indent=2))
+        if summary["rejection_details"]:
+            logger.info("Mixed stress rejection breakdown:\n%s",
+                        json.dumps(summary["rejection_details"], indent=2))
 
         score = summary["accuracy_score"]
         if score < accuracy_threshold:
@@ -3135,6 +3210,15 @@ def run_disaggregated_mixed_stress(example_dir: str,
                 f"Mixed stress accuracy {score:.3f} below threshold "
                 f"{accuracy_threshold:.3f}. Per-profile: "
                 f"{summary['per_profile']}")
+
+        incomplete = summary["incomplete_rate"]
+        if incomplete > incomplete_threshold:
+            raise AssertionError(
+                f"Mixed stress incomplete_rate {incomplete:.3f} above threshold "
+                f"{incomplete_threshold:.3f} "
+                f"(timed_out={summary['timed_out']} "
+                f"server_rejected={summary['server_rejected']} "
+                f"details={summary['rejection_details']})")
 
         # Verify server still healthy after the stress run.
         # Probe /v1/chat/completions (not /v1/models) — the known failure mode
@@ -3531,20 +3615,12 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
         # Estimated wall-clock: 1-2 hours (server startup ~5-10 min + request
         # phase; based on 500-req baseline of ~17.5 min at 64 concurrency on
         # B200, scaled to 512 concurrency which doesn't multiply rate 1:1).
-        # accuracy_threshold=0.0 — the 0.42 gate was calibrated on 8x B200 and
-        # is not achievable on 8x H100 for this mixed workload (30% xgrammar +
-        # 15% long-context 6000-8192-token prompts + 15% cancel-mid-stream):
-        # the ctxtp1x4 + gentp4 pipeline saturates on cross-worker KV transfer
-        # and the server-side kv_transfer_timeout cancels the vast majority of
-        # requests, driving accuracy_score to ~0.001. Fatal regressions are
-        # still caught by (a) setup / server-startup failing and (b) the
-        # post-run disagg_client.py health probe.
         pytest.param(TestConfig(
             model_path='Qwen3/Qwen3-32B-FP8',
             test_desc='req10k-conc512-qwen3_32b_fp8_mixed_stress',
             request_count=10000,
             concurrency=512,
-            accuracy_threshold=0.0,
+            accuracy_threshold=0.42,
             speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
                      marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
     ],
@@ -3596,6 +3672,7 @@ def test_disaggregated_mixed_stress_test(disaggregated_test_root,
         total_requests=test_config.request_count,
         concurrency=test_config.concurrency,
         accuracy_threshold=test_config.accuracy_threshold,
+        incomplete_threshold=test_config.incomplete_threshold,
         server_start_timeout=7200,
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory())
